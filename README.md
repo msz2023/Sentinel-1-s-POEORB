@@ -7,9 +7,10 @@
 
 ## 使用方法
 填好 config.ini 里的 Earthdata 账号(和 ASF Vertex 登录是同一个账号)及路径,然后 python s1_orbit_download.py 即可,依赖只有 requests
+请注意首先安装python的依赖requests
 ```python
 pip install requests
 ```
 
 ## 说明
-实际上每个 POEORB 文件本身的有效期就覆盖约 26 小时(前一天约 23 点到后一天约 1 点),按三天各下一个文件,GAMMA 的 S1_OPOD_vec 等工具在处理跨天数据时都能找到轨道,冗余但最保险。
+实际上每个 POEORB 文件本身的有效期就覆盖约 26 小时(前一天约 23 点到后一天约 1 点),按三天各下一个文件,冗余但最保险。
