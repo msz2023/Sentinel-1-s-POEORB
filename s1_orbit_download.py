@@ -7,7 +7,8 @@ Sentinel-1 精密轨道数据 (AUX_POEORB) 自动下载脚本
   1. 从配置文件读取 ASF(Earthdata) 账号、密码、SLC 路径、轨道保存路径、并行下载数
   2. 自动扫描 SLC 目录(支持 .zip / .SAFE),从文件名解析卫星号(S1A/S1B/S1C)和成像日期
   3. 对每个成像日期,下载覆盖【前一天、当天、后一天】共三天的精密轨道文件
-  4. 多线程并行下载,支持断点跳过(已存在且完整的文件不重复下载)、失败重试
+  4. 多线程并行下载,实时显示每个文件的下载进度条、速度
+  5. 支持断点跳过(已存在且完整的文件不重复下载)、失败重试
 
 用法:
   python s1_orbit_download.py                # 使用脚本同目录下的 config.ini
@@ -20,6 +21,8 @@ Sentinel-1 精密轨道数据 (AUX_POEORB) 自动下载脚本
 import os
 import re
 import sys
+import time
+import threading
 import argparse
 import configparser
 from datetime import datetime, timedelta
@@ -68,6 +71,85 @@ class EarthdataSession(requests.Session):
                     and original != self.AUTH_HOST):
                 del headers["Authorization"]
         return prepared_request
+
+
+# ---------------------------------------------------------------------------
+# 多线程实时进度显示(纯标准库实现,无需 tqdm)
+# 每个正在下载的文件占一行: 进度条 + 百分比 + 已下载/总大小 + 速度
+# ---------------------------------------------------------------------------
+class ProgressDisplay:
+    BAR_WIDTH = 24
+
+    def __init__(self, total_files):
+        self.lock = threading.Lock()
+        self.active = {}            # fname -> [已下载字节, 总字节, 开始时间]
+        self.total_files = total_files
+        self.done_files = 0
+        self.drawn_lines = 0        # 当前屏幕上活动进度区占的行数
+        self.last_render = 0.0
+        self.tty = sys.stdout.isatty()
+        if os.name == "nt":
+            os.system("")           # 激活 Windows 控制台的 ANSI 转义支持
+
+    @staticmethod
+    def _short(fname):
+        """长文件名缩短为 'S1A_V20200101_20200103' 形式,方便一行显示"""
+        m = EOF_PATTERN.match(fname)
+        if m:
+            return f"{m.group(1)}_V{m.group(3)[:8]}_{m.group(4)[:8]}"
+        return fname[-30:]
+
+    def _clear_block(self):
+        """清除上次绘制的活动进度区"""
+        if self.tty and self.drawn_lines:
+            sys.stdout.write(f"\x1b[{self.drawn_lines}F\x1b[J")
+            self.drawn_lines = 0
+
+    def _draw_block(self):
+        """重绘所有正在下载文件的进度行"""
+        if not self.tty:
+            return
+        n = 0
+        for fname, (done, total, t0) in list(self.active.items()):
+            mb_done = done / 1048576
+            speed = done / max(time.time() - t0, 0.01) / 1048576
+            if total > 0:
+                pct = done / total * 100
+                filled = min(self.BAR_WIDTH, int(self.BAR_WIDTH * done / total))
+                bar = "█" * filled + "░" * (self.BAR_WIDTH - filled)
+                line = (f"  ↓ {self._short(fname)} |{bar}| {pct:5.1f}%  "
+                        f"{mb_done:5.1f}/{total/1048576:.1f} MB  {speed:5.2f} MB/s")
+            else:
+                line = f"  ↓ {self._short(fname)}  已下载 {mb_done:.1f} MB  {speed:5.2f} MB/s"
+            sys.stdout.write(line + "\n")
+            n += 1
+        self.drawn_lines = n
+        sys.stdout.flush()
+
+    def start(self, fname, total_bytes):
+        with self.lock:
+            self.active[fname] = [0, total_bytes, time.time()]
+            self._clear_block()
+            self._draw_block()
+
+    def update(self, fname, nbytes):
+        with self.lock:
+            if fname in self.active:
+                self.active[fname][0] += nbytes
+            now = time.time()
+            if now - self.last_render >= 0.2:   # 限制刷新频率,避免闪烁
+                self.last_render = now
+                self._clear_block()
+                self._draw_block()
+
+    def finish(self, fname, status):
+        """文件下载结束:从活动区移除,并输出一条固定的结果行"""
+        with self.lock:
+            self.active.pop(fname, None)
+            self.done_files += 1
+            self._clear_block()
+            print(f"  [{self.done_files}/{self.total_files}] {fname}  ->  {status}")
+            self._draw_block()
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +230,15 @@ def fetch_orbit_index(session, timeout):
 
 
 # ---------------------------------------------------------------------------
-# 下载单个轨道文件(带重试、断点跳过、临时文件防止半截文件)
+# 下载单个轨道文件(带进度回报、重试、断点跳过、临时文件防止半截文件)
 # ---------------------------------------------------------------------------
-def download_one(fname, orbit_dir, username, password, retry, timeout):
+def download_one(fname, orbit_dir, username, password, retry, timeout, disp):
     url = POEORB_BASE_URL + fname
     dst = os.path.join(orbit_dir, fname)
     tmp = dst + ".tmp"
 
     if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+        disp.finish(fname, "跳过(已存在)")
         return fname, "跳过(已存在)"
 
     last_err = None
@@ -164,15 +247,23 @@ def download_one(fname, orbit_dir, username, password, retry, timeout):
             session = EarthdataSession(username, password)
             with session.get(url, stream=True, timeout=timeout) as r:
                 if r.status_code == 401:
-                    return fname, "失败: 账号或密码错误(401)"
+                    status = "失败: 账号或密码错误(401)"
+                    disp.finish(fname, status)
+                    return fname, status
                 r.raise_for_status()
+                total = int(r.headers.get("Content-Length", 0))
+                disp.start(fname, total)          # 重试时会自动清零重新计
                 with open(tmp, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 256):
                         if chunk:
                             f.write(chunk)
+                            disp.update(fname, len(chunk))
             if os.path.getsize(tmp) == 0:
                 raise IOError("下载得到空文件")
+            if 0 < total != os.path.getsize(tmp):
+                raise IOError("文件大小与服务器不一致,可能下载不完整")
             os.replace(tmp, dst)
+            disp.finish(fname, "成功")
             return fname, "成功"
         except Exception as e:
             last_err = e
@@ -181,7 +272,9 @@ def download_one(fname, orbit_dir, username, password, retry, timeout):
                     os.remove(tmp)
                 except OSError:
                     pass
-    return fname, f"失败: {last_err} (已重试{retry}次)"
+    status = f"失败: {last_err} (已重试{retry}次)"
+    disp.finish(fname, status)
+    return fname, status
 
 
 # ---------------------------------------------------------------------------
@@ -239,20 +332,18 @@ def main():
     print(f"[信息] 需下载 {len(tasks)} 个轨道文件,并行数 = {conf['parallel']}")
     print(f"[信息] 保存目录: {conf['orbit_dir']}\n")
 
-    # 4. 并行下载
+    # 4. 并行下载(实时进度显示)
+    disp = ProgressDisplay(len(tasks))
     ok = skip = fail = 0
     with ThreadPoolExecutor(max_workers=conf["parallel"]) as pool:
-        futures = {
+        futures = [
             pool.submit(download_one, f, conf["orbit_dir"],
                         conf["username"], conf["password"],
-                        conf["retry"], conf["timeout"]): f
+                        conf["retry"], conf["timeout"], disp)
             for f in tasks
-        }
-        done = 0
+        ]
         for fut in as_completed(futures):
-            fname, status = fut.result()
-            done += 1
-            print(f"  [{done}/{len(tasks)}] {fname}  ->  {status}")
+            _, status = fut.result()
             if status == "成功":
                 ok += 1
             elif status.startswith("跳过"):
